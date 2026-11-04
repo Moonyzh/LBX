@@ -41,7 +41,9 @@ add_executable(trip_server
   ${PRICING_PB_SRCS}
   ${PRICING_TRPC_PB_SRCS}
   ${TRIP_PB_SRCS}
-  ${TRIP_TRPC_PB_SRCS})
+  ${TRIP_TRPC_PB_SRCS}
+  ${DHT_PB_SRCS}
+  ${DHT_TRPC_PB_SRCS})
 target_include_directories(trip_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(trip_server ${TRPC_LIBRARIES})
 

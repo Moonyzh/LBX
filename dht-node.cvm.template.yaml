@@ -1,0 +1,41 @@
+global:
+  threadmodel:
+    default:
+      - instance_name: default_instance
+        io_handle_type: separate
+        io_thread_num: 2
+        handle_thread_num: 4
+
+# Template for one machine's DHT node. scripts/dht-gen-config.sh renders it into
+# config/dht-node-<x>.cvm.yaml, which is gitignored because it carries real IPs.
+# Do not edit the generated files by hand: change the addresses and re-run.
+server:
+  app: dht
+  server: __NODE_NAME__
+  admin_ip: 0.0.0.0
+  admin_port: __ADMIN_PORT__
+  service:
+    - name: trpc.dht.__NODE_NAME__.DhtService
+      protocol: trpc
+      network: tcp
+      ip: 0.0.0.0
+      port: 19001
+
+client:
+  service:
+    # --successor_service on the command line must match this client name.
+    - name: trpc.dht.__SUCCESSOR_NAME__.DhtService
+      target: __SUCCESSOR_HOST__:19001
+      protocol: trpc
+      network: tcp
+      conn_type: long
+      is_conn_complex: true
+      selector_name: domain
+
+plugins:
+  log:
+    default:
+      - name: default
+        sinks:
+          local_file:
+            filename: /tmp/dht-__NODE_NAME__.log
