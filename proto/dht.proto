@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package trpc.dht;
+
+message PutRequest {
+  string key = 1;
+  bytes value = 2;
+  uint32 hops = 3;
+}
+
+message PutReply {
+  bool ok = 1;
+  string owner = 2;
+  uint32 hops = 3;
+  string message = 4;
+}
+
+message GetRequest {
+  string key = 1;
+  uint32 hops = 2;
+}
+
+message GetReply {
+  bool found = 1;
+  bytes value = 2;
+  string owner = 3;
+  uint32 hops = 4;
+  string message = 5;
+}
+
+service DhtService {
+  rpc Put(PutRequest) returns (PutReply) {}
+  rpc Get(GetRequest) returns (GetReply) {}
+}

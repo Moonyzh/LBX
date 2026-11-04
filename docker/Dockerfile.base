@@ -1,0 +1,28 @@
+# Build this image once before class.  Students must not build tRPC-Cpp itself
+# during the 90-minute lab.  The final stage deliberately excludes /opt source
+# and build directories so the distributable image is much smaller.
+FROM ubuntu:22.04 AS trpc-builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG TRPC_REF=a69d2950f4a9c16b3cb40a2750c69d8940c96820
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates cmake git libssl-dev pkg-config zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone https://github.com/trpc-group/trpc-cpp.git /opt/trpc-cpp \
+    && git -C /opt/trpc-cpp checkout ${TRPC_REF} \
+    && cmake -S /opt/trpc-cpp -B /opt/trpc-cpp/build \
+    && cmake --build /opt/trpc-cpp/build --parallel 2 \
+    && cmake --install /opt/trpc-cpp/build
+
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates cmake pkg-config libcurl4-openssl-dev libssl-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# /usr/local/trpc-cpp contains headers, static libraries, protoc, and the
+# tRPC protoc plugin used when students build the small lab project.
+COPY --from=trpc-builder /usr/local/trpc-cpp /usr/local/trpc-cpp

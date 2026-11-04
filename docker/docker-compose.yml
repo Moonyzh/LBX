@@ -1,0 +1,27 @@
+services:
+  pricing:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: lab1-ride-microservices:local
+    command: ["/app/pricing_server", "--config=/app/config/pricing-service.yaml"]
+    ports:
+      - "18001:8000"
+    networks: [ridenet]
+
+  trip:
+    image: lab1-ride-microservices:local
+    command: ["/app/trip_server", "--config=/app/config/trip-service.yaml"]
+    ports:
+      - "18002:8000"
+    depends_on: [pricing]
+    networks: [ridenet]
+
+  client:
+    image: lab1-ride-microservices:local
+    profiles: ["tools"]
+    networks: [ridenet]
+
+networks:
+  ridenet:
+    driver: bridge

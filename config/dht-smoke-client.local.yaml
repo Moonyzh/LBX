@@ -1,0 +1,38 @@
+global:
+  threadmodel:
+    default:
+      - instance_name: default_instance
+        io_handle_type: merge
+        io_thread_num: 2
+
+client:
+  service:
+    - name: trpc.dht.node-a.DhtService
+      target: 127.0.0.1:19001
+      protocol: trpc
+      network: tcp
+      conn_type: long
+      is_conn_complex: true
+      selector_name: domain
+    - name: trpc.dht.node-b.DhtService
+      target: 127.0.0.1:19002
+      protocol: trpc
+      network: tcp
+      conn_type: long
+      is_conn_complex: true
+      selector_name: domain
+    - name: trpc.dht.node-c.DhtService
+      target: 127.0.0.1:19003
+      protocol: trpc
+      network: tcp
+      conn_type: long
+      is_conn_complex: true
+      selector_name: domain
+
+plugins:
+  log:
+    default:
+      - name: default
+        sinks:
+          local_file:
+            filename: /tmp/dht-smoke-client.log

@@ -1,0 +1,13 @@
+build/
+dht-local-logs/
+*.log
+node-inventory.env
+proto/*.pb.cc
+proto/*.pb.h
+proto/*.trpc.pb.cc
+proto/*.trpc.pb.h
+dist/*.tar.gz
+dist/*.sha256
+submission/*.txt
+submission/*.tar.gz
+config/*.cvm.yaml

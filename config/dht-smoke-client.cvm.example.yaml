@@ -1,0 +1,30 @@
+global:
+  threadmodel:
+    default:
+      - instance_name: default_instance
+        io_handle_type: merge
+        io_thread_num: 2
+
+client:
+  service:
+    - name: trpc.dht.node-a.DhtService
+      target: <NODE_A_REACHABLE_IP>:19001
+      protocol: trpc
+      network: tcp
+      conn_type: long
+      is_conn_complex: true
+      selector_name: domain
+    - name: trpc.dht.node-b.DhtService
+      target: <NODE_B_REACHABLE_IP>:19001
+      protocol: trpc
+      network: tcp
+      conn_type: long
+      is_conn_complex: true
+      selector_name: domain
+    - name: trpc.dht.node-c.DhtService
+      target: <NODE_C_REACHABLE_IP>:19001
+      protocol: trpc
+      network: tcp
+      conn_type: long
+      is_conn_complex: true
+      selector_name: domain

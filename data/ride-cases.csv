@@ -1,0 +1,4 @@
+passenger_id,city,origin,destination,distance_km,time_slot
+alice,wuhan,campus,railway-station,8.5,peak
+alice,wuhan,library,hospital,3.0,offpeak
+bob,wuhan,campus,airport,25.0,peak

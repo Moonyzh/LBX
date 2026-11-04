@@ -1,0 +1,40 @@
+global:
+  threadmodel:
+    default:
+      - instance_name: default_instance
+        io_handle_type: separate
+        io_thread_num: 2
+        handle_thread_num: 4
+
+# This file is an example for node-a. On node-b/node-c, update both
+# server.server and the server service name to match the local node.
+server:
+  app: dht
+  server: node-a
+  admin_ip: 0.0.0.0
+  admin_port: 18081
+  service:
+    - name: trpc.dht.node-a.DhtService
+      protocol: trpc
+      network: tcp
+      ip: 0.0.0.0
+      port: 19001
+
+client:
+  service:
+    # --successor_service must match this client service name.
+    - name: trpc.dht.node-b.DhtService
+      target: 127.0.0.1:19002
+      protocol: trpc
+      network: tcp
+      conn_type: long
+      is_conn_complex: true
+      selector_name: domain
+
+plugins:
+  log:
+    default:
+      - name: default
+        sinks:
+          local_file:
+            filename: /tmp/dht-node-a.log
