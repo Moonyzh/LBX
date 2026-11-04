@@ -1,0 +1,48 @@
+global:
+  threadmodel:
+    default:
+      - instance_name: default_instance
+        io_handle_type: separate
+        io_thread_num: 2
+        handle_thread_num: 4
+
+server:
+  app: ride
+  server: trip
+  admin_ip: 0.0.0.0
+  admin_port: 18080
+  service:
+    - name: trpc.ride.trip.TripService
+      protocol: trpc
+      network: tcp
+      ip: 0.0.0.0
+      port: 8000
+
+client:
+  service:
+    - name: trpc.ride.pricing.PricingService
+      target: pricing:8000
+      protocol: trpc
+      network: tcp
+      conn_type: long
+      is_conn_complex: true
+      selector_name: domain
+
+    # Lab 1B: the only DHT address trip-service knows. node-a forwards Put/Get
+    # along the ring when the key belongs to node-b or node-c, so this entry
+    # stays fixed to node-a even though the data spreads over three nodes.
+    - name: trpc.dht.node-a.DhtService
+      target: dht-node-a:19001
+      protocol: trpc
+      network: tcp
+      conn_type: long
+      is_conn_complex: true
+      selector_name: domain
+
+plugins:
+  log:
+    default:
+      - name: default
+        sinks:
+          local_file:
+            filename: /tmp/trip-service.log

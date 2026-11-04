@@ -1,0 +1,950 @@
+--- a/LAB1B-NODE-A.md
++++ b/LAB1B-NODE-A.md
+@@ -0,0 +1,216 @@
++# 实验 1B · 节点 A 与部署集成（甲）
++
++本文是甲的交付说明：在乙的 DHT 核心（`src/dht_common.*`、`src/dht_service.*`、`src/dht_server.cc`）之上，
++把 trip-service 接入 DHT、并把三台机器的启动、验证、取证串起来。
++
++- DHT 核心由乙提供，本文件不改动它。
++- 订单 RPC 契约（`proto/trip.proto`）不变，`ride_client` 与 pricing-service 无感。
++
++---
++
++## 1. 环设计（与乙的 `dht_common` 实现一致）
++
++哈希：`HashKey` = **32 位 FNV-1a**；归属区间为 `(predecessor_id, node_id]`，跨 0 时回绕。
++
++| 节点 | node_id | predecessor_id | 服务名 | 监听 |
++|---|---|---|---|---|
++| node-a | `0x10000000` | `0xB0000000`（= node-c） | `trpc.dht.node-a.DhtService` | 19001 |
++| node-b | `0x60000000` | `0x10000000`（= node-a） | `trpc.dht.node-b.DhtService` | 19001 |
++| node-c | `0xB0000000` | `0x60000000`（= node-b） | `trpc.dht.node-c.DhtService` | 19001 |
++
++前驱/后继环：
++
++```
++        ┌─────────────── 后继 ───────────────┐
++        ▼                                    │
++   node-a (0x10) ──▶ node-b (0x60) ──▶ node-c (0xB0)
++        ▲                                    │
++        └─────────────── 后继 ───────────────┘
++   每台只需知道自己的 predecessor_id 和 successor 的客户端服务名
++   （--node_id / --predecessor_id / --successor_service）
++```
++
++- 每个节点**只有一条出边**（后继），收到不属于自己的 key 就转发给后继，因此路由是 O(环长)。
++- trip-service **只配置 node-a 一个 DHT 地址**，由 node-a 负责沿环转发。
++
++### 1.1 固定订单号的落点（按乙的 FNV-1a 实测）
++
++| key | HashKey | owner | 从 node-a 入口 |
++|---|---|---|---|
++| `trip:trip-000001` | `0x3FD60345` | node-b | node-a → node-b，1 跳 |
++| `trip:trip-000002` | `0x3CD5FE8C` | node-b | 1 跳 |
++| `trip:trip-000003` | `0x3DD6001F` | node-b | 1 跳 |
++
++> 注意：连续订单号（`trip-000001`～`trip-000100`）在 FNV-1a 下只落在 **node-a / node-b** 两段区间
++> （实测 51 / 49 分布），**node-c 不会成为 trip key 的 owner**。想演示"三个节点都存了数据"，用乙的
++> `scripts/dht-local-test.sh` 里的 `key-0408 / key-0020 / key-0103`，那三个 key 正好覆盖 a/b/c。
++
++## 2. 每台机器准备（三台相同）
++
++1. 腾讯云 CVM ×3，Ubuntu 24.04，2 核 4 GiB。
++2. 安全组放行 TCP 22，以及**三台之间的 TCP 19001**（入站来源填另外两台地址）。只开 22 会表现为 Put 转发失败。
++3. 安装 Docker 与 Compose v2：
++
++   ```bash
++   sudo apt update && sudo apt install -y docker.io docker-compose-v2
++   sudo systemctl enable --now docker && sudo usermod -aG docker "$USER"
++   exit   # 重新登录生效
++   ```
++
++4. 拉课程基础镜像并打标签：
++
++   ```bash
++   docker pull ccr.ccs.tencentyun.com/ccnu-cloudcomputing/trpc-cpp-dev:2026.09
++   docker tag ccr.ccs.tencentyun.com/ccnu-cloudcomputing/trpc-cpp-dev:2026.09 course/trpc-cpp-dev:2026.09
++   ```
++
++5. 把仓库同步到 `~/lab1-mini-dht`：
++
++   ```bash
++   git clone <团队仓库地址> ~/lab1-mini-dht     # 有共享仓库时
++   # 或者：在本地 bash scripts/pack-repo.sh 后 scp 上传并解压
++   ```
++
++6. 构建镜像（**三台都要做**：B、C 只跑 dht_server，也需要本地镜像）：
++
++   ```bash
++   cd ~/lab1-mini-dht/docker && docker compose build pricing && cd ..
++   ```
++
++## 3. 配置生成（任务 3）
++
++节点配置不进 git（`.gitignore` 里有 `config/*.cvm.yaml`），由脚本从模板渲染，避免把真实 IP 提交上去。
++
++```bash
++cd ~/lab1-mini-dht
++export NODE_A_IP=<MACHINE-A-IP> NODE_B_IP=<MACHINE-B-IP> NODE_C_IP=<MACHINE-C-IP>
++bash scripts/dht-gen-config.sh
++```
++
++产出 `config/dht-node-{a,b,c}.cvm.yaml`，其中：
++
++| 文件 | admin_port | 后继服务 | 后继地址 |
++|---|---|---|---|
++| `dht-node-a.cvm.yaml` | 18081 | `trpc.dht.node-b.DhtService` | `<NODE_B_IP>:19001` |
++| `dht-node-b.cvm.yaml` | 18082 | `trpc.dht.node-c.DhtService` | `<NODE_C_IP>:19001` |
++| `dht-node-c.cvm.yaml` | 18083 | `trpc.dht.node-a.DhtService` | `<NODE_A_IP>:19001` |
++
++地址也可以写在 `node-inventory.env` 里（从 `node-inventory.example.env` 复制），脚本会读
++`NODE_A_HOST/NODE_B_HOST/NODE_C_HOST`。
++
++## 4. trip-service 的 DHT 接入（任务 4、5、6）
++
++改动集中在三处：
++
++| 文件 | 改动 |
++|---|---|
++| `config/trip-service.yaml` | 新增客户端服务 `trpc.dht.node-a.DhtService` → `dht-node-a:19001`（固定入口） |
++| `src/trip_service.h` | 去掉内存 map，增加 `dht_proxy_`、`GetDhtProxy()`、`kDhtEntryService` |
++| `src/trip_service.cc` | `CreateRide` 做 `SerializeAsString → Put`；`GetTrip` 做 `Get → ParseFromString` |
++| `CMakeLists.txt` | `trip_server` 链接 `${DHT_PB_SRCS}` 与 `${DHT_TRPC_PB_SRCS}` |
++
++关键代码（`src/trip_service.cc`）：
++
++```cpp
++// CreateRide：定价成功后
++const std::string dht_key = DhtKeyOf(trip_id);          // "trip:" + trip_id
++const std::string dht_value = trip.SerializeAsString();
++::trpc::dht::PutRequest put_request;
++put_request.set_key(dht_key);
++put_request.set_value(dht_value);
++put_request.set_hops(0);
++dht_context->SetFuncName("/trpc.dht.DhtService/Put");
++...  // ok=false 时不返回 trip_id，避免"订单编号已发但环上没存"
++
++// GetTrip
++dht_context->SetFuncName("/trpc.dht.DhtService/Get");
++...  // found=false → reply->set_found(false)
++trip.ParseFromString(get_reply.value());
++```
++
++调用路径写的是 **proto 里的服务名** `/trpc.dht.DhtService/Put`，不是配置里的客户端别名
++`trpc.dht.node-a.DhtService`——配置名只是本地寻址用的，这点和 pricing 的写法一致。
++
++## 5. 三台启动（任务 7）
++
++`docker/docker-compose.yml` 里三个节点都映射 19001，所以**每台只能起自己的那个**：
++
++```bash
++# 机器 A：node-a + pricing + trip
++bash scripts/dht-up-node.sh a
++# 机器 B：只起 node-b
++bash scripts/dht-up-node.sh b
++# 机器 C：只起 node-c
++bash scripts/dht-up-node.sh c
++```
++
++脚本会：渲染配置 → 缺镜像时自动构建 → `docker compose up -d` 对应服务 → 打印本机的后继 target。
++
++核对（脚本末尾也会打印）：A 指向 B 的 IP、B 指向 C 的 IP、C 指向 A 的 IP。
++
++## 6. 验证（任务 7 收尾）
++
++在机器 A 上：
++
++```bash
++bash scripts/dht-verify.sh
++```
++
++预期 11 项 PASS：三笔订单 `create_ok=1`、编号 `trip-000001..3`、票价仍是 `41.04 / 17.20`，
++回读 `found=1`，不存在的订单 `found=0`，而且 trip-service 日志里每笔都有
++`dht_key=trip:trip-00000X dht_owner=node-b dht_hops=1`。
++
++手工看证据：
++
++```bash
++docker compose exec -T trip grep "dht_key" /tmp/trip-service.log
++docker compose logs --tail=50 dht-node-a
++```
++
++## 7. 取证（任务 8）
++
++```bash
++export NODE_A_SSH=ubuntu@<MACHINE-A-IP> NODE_B_SSH=ubuntu@<MACHINE-B-IP> \
++       NODE_C_SSH=ubuntu@<MACHINE-C-IP> REMOTE_DIR=~/lab1-mini-dht
++bash scripts/dht-collect-evidence.sh
++```
++
++产物在 `data/evidence/lab1b/node-{a,b,c}/`：主机名、`docker compose ps`、脱敏后的节点配置、节点日志；
++A 另含 trip / pricing 日志。这就是甲方任务 8 要的四类材料。
++
++## 8. 从空白 CVM 到三节点运行（任务 9）
++
++```bash
++# ===== 安全组：三台互相放行 TCP 19001，另放行 22 =====
++
++# ===== 每台 CVM（0. 环境）=====
++ssh ubuntu@<MACHINE-X-IP>
++sudo apt update && sudo apt install -y docker.io docker-compose-v2
++sudo systemctl enable --now docker && sudo usermod -aG docker "$USER"
++exit && ssh ubuntu@<MACHINE-X-IP>
++docker pull ccr.ccs.tencentyun.com/ccnu-cloudcomputing/trpc-cpp-dev:2026.09
++docker tag ccr.ccs.tencentyun.com/ccnu-cloudcomputing/trpc-cpp-dev:2026.09 course/trpc-cpp-dev:2026.09
++git clone <团队仓库地址> ~/lab1-mini-dht
++cd ~/lab1-mini-dht/docker && docker compose build pricing && cd ..
++
++# ===== 每台 CVM（1. 生成配置 + 启动自己的节点）=====
++cd ~/lab1-mini-dht
++export NODE_A_IP=<MACHINE-A-IP> NODE_B_IP=<MACHINE-B-IP> NODE_C_IP=<MACHINE-C-IP>
++bash scripts/dht-up-node.sh a     # 机器 B 用 b，机器 C 用 c
++
++# ===== 机器 A（2. 验证与取证）=====
++bash scripts/dht-verify.sh
++export NODE_A_SSH=ubuntu@<MACHINE-A-IP> NODE_B_SSH=ubuntu@<MACHINE-B-IP> \
++       NODE_C_SSH=ubuntu@<MACHINE-C-IP> REMOTE_DIR=~/lab1-mini-dht
++bash scripts/dht-collect-evidence.sh
++```
++
++## 9. 常见故障
++
++| 现象 | 原因 |
++|---|---|
++| `put ... forward` 失败 / `hops exceeded` | 安全组没放行 19001，或后继 IP 填错（比对 `config/dht-node-*.cvm.yaml`） |
++| `trip` 起来但 `create_ok=0`，message 含 `dht put rpc failed` | trip 比 node-a 先就绪；等几秒重跑，或 `docker compose restart trip` |
++| `dht entry node-a proxy is unavailable` | `config/trip-service.yaml` 里的客户端服务名被改坏 |
++| B/C 启动报 `pull access denied` | 漏了 `docker compose build pricing` |
++| 验证时 `found=0` 但订单刚创建过 | 容器重启过：DHT 存储是进程内 map，重启即清空 |
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -41,7 +41,9 @@
+   ${PRICING_PB_SRCS}
+   ${PRICING_TRPC_PB_SRCS}
+   ${TRIP_PB_SRCS}
+-  ${TRIP_TRPC_PB_SRCS})
++  ${TRIP_TRPC_PB_SRCS}
++  ${DHT_PB_SRCS}
++  ${DHT_TRPC_PB_SRCS})
+ target_include_directories(trip_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+ target_link_libraries(trip_server ${TRPC_LIBRARIES})
+ 
+--- a/config/dht-node.cvm.template.yaml
++++ b/config/dht-node.cvm.template.yaml
+@@ -0,0 +1,41 @@
++global:
++  threadmodel:
++    default:
++      - instance_name: default_instance
++        io_handle_type: separate
++        io_thread_num: 2
++        handle_thread_num: 4
++
++# Template for one machine's DHT node. scripts/dht-gen-config.sh renders it into
++# config/dht-node-<x>.cvm.yaml, which is gitignored because it carries real IPs.
++# Do not edit the generated files by hand: change the addresses and re-run.
++server:
++  app: dht
++  server: __NODE_NAME__
++  admin_ip: 0.0.0.0
++  admin_port: __ADMIN_PORT__
++  service:
++    - name: trpc.dht.__NODE_NAME__.DhtService
++      protocol: trpc
++      network: tcp
++      ip: 0.0.0.0
++      port: 19001
++
++client:
++  service:
++    # --successor_service on the command line must match this client name.
++    - name: trpc.dht.__SUCCESSOR_NAME__.DhtService
++      target: __SUCCESSOR_HOST__:19001
++      protocol: trpc
++      network: tcp
++      conn_type: long
++      is_conn_complex: true
++      selector_name: domain
++
++plugins:
++  log:
++    default:
++      - name: default
++        sinks:
++          local_file:
++            filename: /tmp/dht-__NODE_NAME__.log
+--- a/config/trip-service.yaml
++++ b/config/trip-service.yaml
+@@ -28,6 +28,17 @@
+       is_conn_complex: true
+       selector_name: domain
+ 
++    # Lab 1B: the only DHT address trip-service knows. node-a forwards Put/Get
++    # along the ring when the key belongs to node-b or node-c, so this entry
++    # stays fixed to node-a even though the data spreads over three nodes.
++    - name: trpc.dht.node-a.DhtService
++      target: dht-node-a:19001
++      protocol: trpc
++      network: tcp
++      conn_type: long
++      is_conn_complex: true
++      selector_name: domain
++
+ plugins:
+   log:
+     default:
+--- a/docker/docker-compose.yml
++++ b/docker/docker-compose.yml
+@@ -1,4 +1,62 @@
+ services:
++  # ---------------------------------------------------------------------------
++  # Lab 1B: three DHT nodes. Each machine starts ONLY its own node, because one
++  # per machine binds 19001 on the host:
++  #   machine A: docker compose up -d dht-node-a pricing trip
++  #   machine B: docker compose up -d dht-node-b
++  #   machine C: docker compose up -d dht-node-c
++  # Node ids and predecessor ids are fixed so the ring is A -> B -> C -> A.
++  # Successor addresses come from config/dht-node-<x>.cvm.yaml, generated by
++  # scripts/dht-gen-config.sh from the three reachable IPs.
++  # ---------------------------------------------------------------------------
++  dht-node-a:
++    image: lab1-ride-microservices:local
++    container_name: dht-node-a
++    command:
++      - /app/dht_server
++      - --config=/app/config/dht-node-a.cvm.yaml
++      - --node_name=node-a
++      - --node_id=0x10000000
++      - --predecessor_id=0xB0000000
++      - --successor_service=trpc.dht.node-b.DhtService
++    ports:
++      - "19001:19001"
++    volumes:
++      - ../config:/app/config:ro
++    networks: [ridenet]
++
++  dht-node-b:
++    image: lab1-ride-microservices:local
++    container_name: dht-node-b
++    command:
++      - /app/dht_server
++      - --config=/app/config/dht-node-b.cvm.yaml
++      - --node_name=node-b
++      - --node_id=0x60000000
++      - --predecessor_id=0x10000000
++      - --successor_service=trpc.dht.node-c.DhtService
++    ports:
++      - "19001:19001"
++    volumes:
++      - ../config:/app/config:ro
++    networks: [ridenet]
++
++  dht-node-c:
++    image: lab1-ride-microservices:local
++    container_name: dht-node-c
++    command:
++      - /app/dht_server
++      - --config=/app/config/dht-node-c.cvm.yaml
++      - --node_name=node-c
++      - --node_id=0xB0000000
++      - --predecessor_id=0x60000000
++      - --successor_service=trpc.dht.node-a.DhtService
++    ports:
++      - "19001:19001"
++    volumes:
++      - ../config:/app/config:ro
++    networks: [ridenet]
++
+   pricing:
+     build:
+       context: ..
+@@ -14,7 +72,7 @@
+     command: ["/app/trip_server", "--config=/app/config/trip-service.yaml"]
+     ports:
+       - "18002:8000"
+-    depends_on: [pricing]
++    depends_on: [pricing, dht-node-a]
+     networks: [ridenet]
+ 
+   client:
+--- a/scripts/README.md
++++ b/scripts/README.md
+@@ -11,6 +11,11 @@
+ - `dht-local-test.sh`：在一台机器启动三个 DHT 进程并验证逐跳 Put/Get。
+ - `start-node-b.sh`：启动乙负责的 node-b CVM 节点。
+ - `upload-node-b.ps1`：从本地 Windows 上传 node-b 正式配置和启动脚本。
++- `dht-gen-config.sh`：由 `config/dht-node.cvm.template.yaml` 渲染三台机器的 `config/dht-node-*.cvm.yaml`（地址来自 `NODE_A_IP/...` 或 `node-inventory.env`）。
++- `dht-up-node.sh a|b|c`：每台只启动自己的 DHT 节点；机器 A 额外启动 pricing 与 trip。
++- `dht-verify.sh`：在机器 A 上验证三笔订单经 DHT Put/Get 存取，并打印 owner/hops。
++- `dht-collect-evidence.sh`：SSH 收集三台机器的主机名、compose ps、节点配置（IP 脱敏）与日志。
++- `pack-repo.sh`：把仓库打成压缩包，用于 scp 上传到 CVM（替代 `git clone`）。
+ - `build-base-image.sh`、`export-base-image.sh`：仅供教师准备镜像。
+ 
+ 从仓库根目录用 `bash scripts/<名称>.sh` 运行。云主机账号需已加入 Docker 用户组并重新登录。
+--- a/scripts/dht-collect-evidence.sh
++++ b/scripts/dht-collect-evidence.sh
+@@ -0,0 +1,87 @@
++#!/usr/bin/env bash
++# Collect the evidence required by task 8 from all three machines.
++# Run on your own computer or on machine A; it only needs SSH access.
++#
++#   export NODE_A_SSH=ubuntu@<A-IP> NODE_B_SSH=ubuntu@<B-IP> NODE_C_SSH=ubuntu@<C-IP>
++#   export REMOTE_DIR=~/lab1-mini-dht
++#   bash scripts/dht-collect-evidence.sh
++#
++# Output: data/evidence/lab1b/node-{a,b,c}/  (hostname, compose ps, node config, logs)
++# IPv4 addresses in the collected configs are masked to <IP> so the bundle can be
++# attached to the report without leaking the VPC layout.
++set -euo pipefail
++
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++cd "$ROOT"
++
++REMOTE_DIR="${REMOTE_DIR:-~/lab1-mini-dht}"
++OUT_ROOT="${OUT_ROOT:-data/evidence/lab1b}"
++STAMP="$(date +%Y%m%d-%H%M%S)"
++
++for name in NODE_A_SSH NODE_B_SSH NODE_C_SSH; do
++  if [[ -z "${!name:-}" ]]; then
++    echo "需要 $name（形如 ubuntu@1.2.3.4）" >&2
++    exit 2
++  fi
++done
++
++mkdir -p "$OUT_ROOT"
++
++mask_ips() {
++  sed -E 's/([0-9]{1,3}\.){3}[0-9]{1,3}/<IP>/g'
++}
++
++collect_one() {
++  local letter="$1" target="$2"
++  local dir="${OUT_ROOT}/node-${letter}"
++  mkdir -p "$dir"
++
++  echo "== node-${letter} (${target}) =="
++
++  ssh -o ConnectTimeout=10 "$target" "hostname" > "${dir}/hostname.txt" 2>&1 || true
++  ssh -o ConnectTimeout=10 "$target" "cd ${REMOTE_DIR}/docker && docker compose ps" \
++    > "${dir}/compose-ps.txt" 2>&1 || true
++  ssh -o ConnectTimeout=10 "$target" "cat ${REMOTE_DIR}/config/dht-node-${letter}.cvm.yaml" \
++    2>/dev/null | mask_ips > "${dir}/dht-node-${letter}.cvm.masked.yaml" || true
++  ssh -o ConnectTimeout=10 "$target" \
++    "cd ${REMOTE_DIR}/docker && docker compose logs --no-color --tail=300 dht-node-${letter}" \
++    > "${dir}/dht-node-${letter}.log" 2>&1 || true
++
++  # machine A also runs pricing + trip, so keep their logs with A's node
++  if [[ "$letter" == "a" ]]; then
++    ssh -o ConnectTimeout=10 "$target" \
++      "cd ${REMOTE_DIR}/docker && docker compose logs --no-color --tail=300 trip" \
++      > "${dir}/trip.log" 2>&1 || true
++    ssh -o ConnectTimeout=10 "$target" \
++      "cd ${REMOTE_DIR}/docker && docker compose logs --no-color --tail=200 pricing" \
++      > "${dir}/pricing.log" 2>&1 || true
++    ssh -o ConnectTimeout=10 "$target" \
++      "cd ${REMOTE_DIR}/docker && docker compose exec -T trip cat /tmp/trip-service.log" \
++      > "${dir}/trip-service.log" 2>&1 || true
++  fi
++
++  echo "   -> ${dir}"
++}
++
++collect_one a "$NODE_A_SSH"
++collect_one b "$NODE_B_SSH"
++collect_one c "$NODE_C_SSH"
++
++cat > "${OUT_ROOT}/README-${STAMP}.md" <<EOF
++# 实验 1B 取证（${STAMP}）
++
++| 文件 | 内容 |
++|---|---|
++| \`node-*/hostname.txt\` | 每台机器的主机名 |
++| \`node-*/compose-ps.txt\` | 每台机器 \`docker compose ps\`，证明只跑自己的节点 |
++| \`node-*/dht-node-*.cvm.masked.yaml\` | 生效的节点配置（IP 已脱敏） |
++| \`node-*/dht-node-*.log\` | 节点日志，含 \`put/get key=... owner=... hops=...\` |
++| \`node-a/trip.log\`、\`node-a/trip-service.log\` | 订单服务日志，含 \`dht_key/dht_owner/dht_hops\` |
++| \`node-a/pricing.log\` | 计价服务日志 |
++
++注意：DHT 节点存储是进程内 map，容器重启即清空。
++EOF
++
++echo
++echo "evidence: ${OUT_ROOT} (manifest: README-${STAMP}.md)"
++find "$OUT_ROOT" -type f -newermt '-5 minutes' | sort | sed 's/^/  /'
+--- a/scripts/dht-gen-config.sh
++++ b/scripts/dht-gen-config.sh
+@@ -0,0 +1,68 @@
++#!/usr/bin/env bash
++# Render config/dht-node-{a,b,c}.cvm.yaml from config/dht-node.cvm.template.yaml.
++#
++# Ring (fixed by the team, matches the --node_id flags in docker-compose.yml):
++#   node-a 0x10000000  predecessor 0xB0000000 (node-c)  successor node-b
++#   node-b 0x60000000  predecessor 0x10000000 (node-a)  successor node-c
++#   node-c 0xB0000000  predecessor 0x60000000 (node-b)  successor node-a
++#
++# Addresses come from NODE_A_IP / NODE_B_IP / NODE_C_IP, or from node-inventory.env
++# (copy node-inventory.example.env and fill NODE_A_HOST / NODE_B_HOST / NODE_C_HOST).
++set -euo pipefail
++
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++cd "$ROOT"
++
++TEMPLATE="config/dht-node.cvm.template.yaml"
++INVENTORY="${NODE_INVENTORY:-node-inventory.env}"
++
++if [[ ! -f "$TEMPLATE" ]]; then
++  echo "missing template: $TEMPLATE" >&2
++  exit 2
++fi
++
++# env vars win; otherwise load the local inventory file
++if [[ -z "${NODE_A_IP:-}" || -z "${NODE_B_IP:-}" || -z "${NODE_C_IP:-}" ]]; then
++  if [[ -f "$INVENTORY" ]]; then
++    # shellcheck disable=SC1090
++    set -a && . "$INVENTORY" && set +a
++    NODE_A_IP="${NODE_A_IP:-${NODE_A_HOST:-}}"
++    NODE_B_IP="${NODE_B_IP:-${NODE_B_HOST:-}}"
++    NODE_C_IP="${NODE_C_IP:-${NODE_C_HOST:-}}"
++  fi
++fi
++
++missing=0
++for name in NODE_A_IP NODE_B_IP NODE_C_IP; do
++  value="${!name:-}"
++  if [[ -z "$value" || "$value" == "<"*">" ]]; then
++    echo "需要 $name（三台机器的互通地址）；可直接 export，或写进 $INVENTORY" >&2
++    missing=1
++  fi
++done
++[ "$missing" -eq 0 ] || exit 2
++
++render() {
++  local letter="$1" node="$2" admin_port="$3" successor="$4" successor_host="$5"
++  local out="config/dht-node-${letter}.cvm.yaml"
++
++  sed -e "s/__NODE_NAME__/${node}/g" \
++      -e "s/__ADMIN_PORT__/${admin_port}/g" \
++      -e "s/__SUCCESSOR_NAME__/${successor}/g" \
++      -e "s/__SUCCESSOR_HOST__/${successor_host}/g" \
++      "$TEMPLATE" > "$out"
++
++  if grep -q "__" "$out"; then
++    echo "占位符未替换干净: $out" >&2
++    exit 3
++  fi
++  echo "generated ${out}  node=${node}  successor=trpc.dht.${successor}.DhtService -> ${successor_host}:19001"
++}
++
++render a node-a 18081 node-b "$NODE_B_IP"
++render b node-b 18082 node-c "$NODE_C_IP"
++render c node-c 18083 node-a "$NODE_A_IP"
++
++echo
++echo "ring: node-a(0x10000000) -> node-b(0x60000000) -> node-c(0xB0000000) -> node-a"
++echo "三台机器各自的互通地址：A=${NODE_A_IP} B=${NODE_B_IP} C=${NODE_C_IP}"
+--- a/scripts/dht-up-node.sh
++++ b/scripts/dht-up-node.sh
+@@ -0,0 +1,61 @@
++#!/usr/bin/env bash
++# Start exactly one DHT node on this machine, plus pricing and trip on machine A.
++#
++#   machine A: bash scripts/dht-up-node.sh a     # dht-node-a + pricing + trip
++#   machine B: bash scripts/dht-up-node.sh b     # dht-node-b only
++#   machine C: bash scripts/dht-up-node.sh c     # dht-node-c only
++#
++# Requires the three reachable addresses: export NODE_A_IP / NODE_B_IP / NODE_C_IP
++# (or keep them in node-inventory.env).
++set -euo pipefail
++
++NODE="${1:-}"
++case "$NODE" in
++  a|b|c) ;;
++  *)
++    echo "usage: bash scripts/dht-up-node.sh a|b|c" >&2
++    exit 2
++    ;;
++esac
++
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++cd "$ROOT"
++
++IMAGE="lab1-ride-microservices:local"
++
++# 1. Render this machine's node config (re-renders all three, harmless).
++bash scripts/dht-gen-config.sh
++
++for f in pricing-service trip-service; do
++  [[ -f "config/${f}.yaml" ]] || { echo "missing config/${f}.yaml" >&2; exit 2; }
++done
++
++# 2. Every machine needs the shared image locally: B and C only run dht_server,
++#    but they still start it from the same image.
++if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
++  echo "image ${IMAGE} not found locally, building it (first run takes a few minutes)"
++  (cd docker && docker compose build pricing)
++fi
++
++# 3. Start only this machine's services.
++cd docker
++if [[ "$NODE" == "a" ]]; then
++  # trip-service enters the ring at node-a, so pricing and trip live here too.
++  docker compose up -d dht-node-a pricing trip
++else
++  docker compose up -d "dht-node-${NODE}"
++fi
++
++sleep 2
++docker compose ps
++
++echo
++echo "successor target in this machine's node config:"
++grep "target:" "${ROOT}/config/dht-node-${NODE}.cvm.yaml" || true
++
++cat <<EOF
++
++下一步：
++  * 三台都启动后，在机器 A 上执行  bash scripts/dht-verify.sh
++  * 查看本机节点日志        docker compose logs -f dht-node-${NODE}
++EOF
+--- a/scripts/dht-verify.sh
++++ b/scripts/dht-verify.sh
+@@ -0,0 +1,88 @@
++#!/usr/bin/env bash
++# End-to-end check for Lab 1B, run on machine A after all three nodes are up.
++#
++# Proves two things at once:
++#   1. ride_client -> trip-service contract is unchanged (same fares as 1A)
++#   2. every order really goes through Put("trip:"+id) / Get("trip:"+id) on the
++#      node-a entry, and the ring answers with an owner + hop count
++set -euo pipefail
++
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++cd "$ROOT"
++
++failures=0
++
++assert_contains() {
++  local text="$1" expected="$2" label="$3"
++  if grep -Fq "$expected" <<<"$text"; then
++    echo "PASS: $label"
++  else
++    echo "FAIL: $label (expected [$expected])" >&2
++    echo "$text" >&2
++    failures=$((failures + 1))
++  fi
++}
++
++echo "== 1. 创建三笔订单（trip-service 应写入 DHT）=="
++create_1="$(bash scripts/client.sh --op=create --passenger_id=alice --origin=campus \
++  --destination=railway-station --distance_km=8.5 --time_slot=peak)"
++echo "$create_1"
++assert_contains "$create_1" "create_ok=1" "peak CreateRide 成功"
++assert_contains "$create_1" "trip_id=trip-000001" "第一笔 trip_id 可预测"
++assert_contains "$create_1" "estimated_fare=41.04" "peak 票价与 1A 一致"
++
++create_2="$(bash scripts/client.sh --op=create --passenger_id=bob --origin=library \
++  --destination=hospital --distance_km=3.0 --time_slot=offpeak)"
++echo "$create_2"
++assert_contains "$create_2" "create_ok=1" "offpeak CreateRide 成功"
++assert_contains "$create_2" "trip_id=trip-000002" "第二笔 trip_id 可预测"
++assert_contains "$create_2" "estimated_fare=17.20" "offpeak 票价与 1A 一致"
++
++create_3="$(bash scripts/client.sh --op=create --passenger_id=carol --origin=hotel \
++  --destination=airport --distance_km=6.0 --time_slot=peak)"
++echo "$create_3"
++assert_contains "$create_3" "create_ok=1" "第三笔 CreateRide 成功"
++assert_contains "$create_3" "trip_id=trip-000003" "第三笔 trip_id 可预测"
++
++echo
++echo "== 2. 按 trip_id 回读（trip-service 应从 DHT 取回并反序列化）=="
++for id in trip-000001 trip-000002 trip-000003; do
++  got="$(bash scripts/client.sh --op=get --trip_id="$id")"
++  echo "$got"
++  assert_contains "$got" "found=1" "$id 能从 DHT 读回"
++  assert_contains "$got" "status=WAITING" "$id 状态字段保留"
++done
++
++missing="$(bash scripts/client.sh --op=get --trip_id=trip-999999)"
++echo "$missing"
++assert_contains "$missing" "found=0" "不存在的订单返回 found=0"
++
++echo
++echo "== 3. 三笔订单确实经过 DHT 入口 node-a =="
++log="$(cd docker && docker compose exec -T trip sh -c 'cat /tmp/trip-service.log' 2>/dev/null | grep -F "trip:" || true)"
++echo "$log"
++if [[ -z "$log" ]]; then
++  echo "FAIL: trip-service 日志里没有 DHT 记录" >&2
++  failures=$((failures + 1))
++else
++  for id in trip-000001 trip-000002 trip-000003; do
++    line="$(grep -F "dht_key=trip:${id}" <<<"$log" | tail -1 || true)"
++    if [[ -n "$line" ]]; then
++      echo "PASS: ${id} 的 DHT 记录 -> $(grep -oE 'dht_owner=[^ ]+|dht_hops=[^ ]+' <<<"$line" | tr '\n' ' ')"
++    else
++      echo "FAIL: 日志里找不到 ${id} 的 DHT 记录" >&2
++      failures=$((failures + 1))
++    fi
++  done
++  owners="$(grep -oE 'dht_owner=node-[abc]' <<<"$log" | sort -u | tr '\n' ' ')"
++  echo "本次涉及的 owner：${owners:-无}"
++fi
++
++echo
++if [[ "$failures" -eq 0 ]]; then
++  echo "dht 三节点验证：全部通过"
++  echo "取证命令： docker compose logs dht-node-a ; docker compose exec -T trip cat /tmp/trip-service.log"
++else
++  echo "dht 三节点验证：${failures} 项失败" >&2
++  exit 1
++fi
+--- a/scripts/pack-repo.sh
++++ b/scripts/pack-repo.sh
+@@ -0,0 +1,30 @@
++#!/usr/bin/env bash
++# Pack the repository for upload to a CVM when there is no reachable git remote.
++#
++#   bash scripts/pack-repo.sh
++#   -> dist/lab1-mini-dht-src.tar.gz   (source only, no build output, no real IPs)
++#
++# Excluded on purpose: build/, dist/, dht-local-logs/, data/evidence/,
++# config/*.cvm.yaml and node-inventory.env (they carry real machine addresses).
++set -euo pipefail
++
++cd "$(dirname "$0")/.."
++
++OUT="dist/lab1-mini-dht-src.tar.gz"
++mkdir -p dist
++
++tar -czf "$OUT" \
++  --exclude=./.git \
++  --exclude=./build \
++  --exclude=./dht-local-logs \
++  --exclude=./data/evidence \
++  --exclude=./dist \
++  --exclude=./node-inventory.env \
++  --exclude='./config/*.cvm.yaml' \
++  --exclude=./proto/*.pb.cc \
++  --exclude=./proto/*.pb.h \
++  .
++
++echo "archive : ${OUT}"
++echo -n "size    : "; du -h "$OUT" | cut -f1
++echo "files   : $(tar -tzf "$OUT" | grep -vc '/$')"
+--- a/src/trip_service.cc
++++ b/src/trip_service.cc
+@@ -3,8 +3,10 @@
+ #include <cmath>
+ #include <iomanip>
+ #include <sstream>
++#include <string>
+ #include <utility>
+ 
++#include "proto/dht.trpc.pb.h"
+ #include "trpc/client/make_client_context.h"
+ #include "trpc/client/trpc_client.h"
+ #include "trpc/common/status.h"
+@@ -22,8 +24,12 @@
+ 
+ TripServiceImpl::TripServiceImpl() = default;
+ 
++std::string TripServiceImpl::DhtKeyOf(const std::string& trip_id) {
++  return "trip:" + trip_id;
++}
++
+ std::string TripServiceImpl::NextTripId() {
+-  std::lock_guard<std::mutex> lock(trips_mutex_);
++  std::lock_guard<std::mutex> lock(id_mutex_);
+   std::ostringstream stream;
+   stream << "trip-" << std::setfill('0') << std::setw(6) << next_trip_number_++;
+   return stream.str();
+@@ -38,6 +44,17 @@
+   return pricing_proxy_;
+ }
+ 
++std::shared_ptr<::trpc::RpcServiceProxy> TripServiceImpl::GetDhtProxy() {
++  std::lock_guard<std::mutex> lock(proxy_mutex_);
++  if (!dht_proxy_) {
++    // The client service with this name is declared in config/trip-service.yaml
++    // and points at node-a only. Ring traversal happens inside the DHT nodes.
++    dht_proxy_ =
++        ::trpc::GetTrpcClient()->GetProxy<::trpc::RpcServiceProxy>(kDhtEntryService);
++  }
++  return dht_proxy_;
++}
++
+ ::trpc::Status TripServiceImpl::CreateRide(
+     ::trpc::ServerContextPtr context, const ::trpc::ride::CreateRideRequest* request,
+     ::trpc::ride::CreateRideReply* reply) {
+@@ -79,7 +96,8 @@
+   }
+ 
+   ::trpc::ride::Trip trip;
+-  trip.set_trip_id(NextTripId());
++  const std::string trip_id = NextTripId();
++  trip.set_trip_id(trip_id);
+   trip.set_passenger_id(request->passenger_id());
+   trip.set_city(request->city());
+   trip.set_origin(request->origin());
+@@ -88,31 +106,99 @@
+   trip.set_time_slot(request->time_slot());
+   trip.set_estimated_fare(pricing_reply.total_fare());
+   trip.set_status("WAITING");
+-  {
+-    std::lock_guard<std::mutex> lock(trips_mutex_);
+-    trips_[trip.trip_id()] = trip;
++
++  // Lab 1B: Trip.SerializeAsString() -> Put("trip:" + trip_id, bytes).
++  const std::string dht_key = DhtKeyOf(trip_id);
++  const std::string dht_value = trip.SerializeAsString();
++  const auto dht_proxy = GetDhtProxy();
++  if (!dht_proxy) {
++    reply->set_ok(false);
++    reply->set_message("dht entry node-a proxy is unavailable");
++    return ::trpc::kSuccStatus;
++  }
++
++  ::trpc::dht::PutRequest put_request;
++  put_request.set_key(dht_key);
++  put_request.set_value(dht_value);
++  put_request.set_hops(0);
++  ::trpc::dht::PutReply put_reply;
++  const auto dht_context = ::trpc::MakeClientContext(context, dht_proxy);
++  dht_context->SetFuncName("/trpc.dht.DhtService/Put");
++  const ::trpc::Status put_status =
++      dht_proxy->UnaryInvoke<::trpc::dht::PutRequest, ::trpc::dht::PutReply>(
++          dht_context, put_request, &put_reply);
++  if (!put_status.OK() || !put_reply.ok()) {
++    // Do not hand back a trip id that the ring never accepted.
++    reply->set_ok(false);
++    reply->set_message(put_status.OK() ? "dht put failed: " + put_reply.message()
++                                       : "dht put rpc failed: " + put_status.ErrorMessage());
++    TRPC_FMT_WARN("create ride trip_id={} dht_key={} put=0 passenger_id={} result={}", trip_id,
++                  dht_key, request->passenger_id(), reply->message());
++    return ::trpc::kSuccStatus;
+   }
++
+   *reply->mutable_trip() = trip;
+   reply->set_ok(true);
+-  reply->set_message("trip created after pricing-service quote");
+-  TRPC_FMT_INFO("trip_id={} passenger_id={} downstream=pricing-service estimated_fare={}",
+-                trip.trip_id(), trip.passenger_id(), trip.estimated_fare());
++  reply->set_message("trip created after pricing quote and stored in dht node-a entry");
++  TRPC_FMT_INFO(
++      "trip_id={} passenger_id={} downstream=pricing-service estimated_fare={} dht_key={} "
++      "dht_owner={} dht_hops={} bytes={}",
++      trip.trip_id(), trip.passenger_id(), trip.estimated_fare(), dht_key, put_reply.owner(),
++      put_reply.hops(), dht_value.size());
+   return ::trpc::kSuccStatus;
+ }
+ 
+ ::trpc::Status TripServiceImpl::GetTrip(::trpc::ServerContextPtr context,
+                                          const ::trpc::ride::GetTripRequest* request,
+                                          ::trpc::ride::GetTripReply* reply) {
+-  std::lock_guard<std::mutex> lock(trips_mutex_);
+-  const auto it = trips_.find(request->trip_id());
+-  reply->set_found(it != trips_.end());
+-  if (it != trips_.end()) {
+-    *reply->mutable_trip() = it->second;
+-    reply->set_message("trip read from local teaching repository");
+-  } else {
+-    reply->set_message("trip not found");
++  const std::string dht_key = DhtKeyOf(request->trip_id());
++  const auto dht_proxy = GetDhtProxy();
++  if (!dht_proxy) {
++    reply->set_found(false);
++    reply->set_message("dht entry node-a proxy is unavailable");
++    return ::trpc::kSuccStatus;
++  }
++
++  // Lab 1B: Get("trip:" + trip_id) -> Trip.ParseFromString(value).
++  ::trpc::dht::GetRequest get_request;
++  get_request.set_key(dht_key);
++  get_request.set_hops(0);
++  ::trpc::dht::GetReply get_reply;
++  const auto dht_context = ::trpc::MakeClientContext(context, dht_proxy);
++  dht_context->SetFuncName("/trpc.dht.DhtService/Get");
++  const ::trpc::Status get_status =
++      dht_proxy->UnaryInvoke<::trpc::dht::GetRequest, ::trpc::dht::GetReply>(
++          dht_context, get_request, &get_reply);
++  if (!get_status.OK()) {
++    reply->set_found(false);
++    reply->set_message("dht get rpc failed: " + get_status.ErrorMessage());
++    TRPC_FMT_WARN("get trip trip_id={} dht_key={} rpc_error={}", request->trip_id(), dht_key,
++                  get_status.ErrorMessage());
++    return ::trpc::kSuccStatus;
++  }
++  if (!get_reply.found()) {
++    reply->set_found(false);
++    reply->set_message("trip not found in dht: " + get_reply.message());
++    TRPC_FMT_INFO("trip_id={} found=0 dht_key={} dht_owner={} dht_hops={}", request->trip_id(),
++                  dht_key, get_reply.owner(), get_reply.hops());
++    return ::trpc::kSuccStatus;
+   }
+-  TRPC_FMT_INFO("trip_id={} found={}", request->trip_id(), it != trips_.end());
++
++  ::trpc::ride::Trip trip;
++  if (!trip.ParseFromString(get_reply.value())) {
++    reply->set_found(false);
++    reply->set_message("dht value cannot be parsed as Trip");
++    TRPC_FMT_ERROR("trip_id={} dht_key={} parse_failed bytes={}", request->trip_id(), dht_key,
++                   get_reply.value().size());
++    return ::trpc::kSuccStatus;
++  }
++
++  *reply->mutable_trip() = trip;
++  reply->set_found(true);
++  reply->set_message("trip read from dht through node-a entry");
++  TRPC_FMT_INFO("trip_id={} found=1 dht_key={} dht_owner={} dht_hops={} bytes={}",
++                request->trip_id(), dht_key, get_reply.owner(), get_reply.hops(),
++                get_reply.value().size());
+   return ::trpc::kSuccStatus;
+ }
+ 
+--- a/src/trip_service.h
++++ b/src/trip_service.h
+@@ -4,7 +4,6 @@
+ #include <memory>
+ #include <mutex>
+ #include <string>
+-#include <unordered_map>
+ 
+ #include "proto/pricing.trpc.pb.h"
+ #include "proto/trip.trpc.pb.h"
+@@ -12,9 +11,11 @@
+ 
+ namespace lab1 {
+ 
+-// Trip owns an order's lifecycle. The in-memory map is intentional in 1A:
+-// it keeps the exercise on service-to-service RPC. Lab 1B replaces this map
+-// with a DHT-backed repository without changing CreateRide or GetTrip.
++// Trip owns an order's lifecycle. Lab 1B replaces the 1A in-memory map with
++// the DHT: every order is stored through the node-a entry as
++//     key   = "trip:" + trip_id
++//     value = Trip.SerializeAsString()
++// The RPC contract with ride_client is unchanged.
+ class TripServiceImpl final : public ::trpc::ride::TripService {
+  public:
+   TripServiceImpl();
+@@ -29,12 +30,19 @@
+  private:
+   std::string NextTripId();
+   std::shared_ptr<::trpc::RpcServiceProxy> GetPricingProxy();
++  std::shared_ptr<::trpc::RpcServiceProxy> GetDhtProxy();
++
++  // trip-service always enters the ring at node-a; it never talks to node-b or
++  // node-c directly. The node forwards along its successor when needed.
++  static constexpr const char* kDhtEntryService = "trpc.dht.node-a.DhtService";
++  static std::string DhtKeyOf(const std::string& trip_id);
+ 
+   std::shared_ptr<::trpc::RpcServiceProxy> pricing_proxy_;
++  std::shared_ptr<::trpc::RpcServiceProxy> dht_proxy_;
+   std::mutex proxy_mutex_;
+-  std::unordered_map<std::string, ::trpc::ride::Trip> trips_;
+-  std::mutex trips_mutex_;
++
+   std::uint64_t next_trip_number_{1};
++  std::mutex id_mutex_;
+ };
+ 
+ }  // namespace lab1
